@@ -1,0 +1,543 @@
+esphome:
+  name: weather-station
+  friendly_name: Weather-Station
+  on_boot:
+    priority: 200
+    then:
+      - lambda: |-
+          float eso = id(csapadek).state;
+          for (int i = 0; i < 1440; i++) {
+            id(history)[i] = eso;
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "YOUR ENCRYPTION KEY"
+
+ota:
+  - platform: esphome
+    password: "YOUR OTA PASSWORD"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.1.19 # Your fix ip
+    gateway: 192.168.1.1    #Your gareway ip
+    subnet: 255.255.255.0
+    dns1: 8.8.8.8
+    dns2: 8.8.4.4
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Weather-Station Fallback Hotspot"
+    password: "YOUR AP PASSWORD"
+
+web_server:
+  port: 80
+
+captive_portal:
+
+uart:
+  - id: mod_bus
+    tx_pin: GPIO17
+    rx_pin: GPIO16
+    baud_rate: 9600
+    parity: NONE 
+    stop_bits: 1
+
+  - id: pms_bus
+    tx_pin: GPIO01
+    rx_pin: GPIO03
+    baud_rate: 9600
+
+modbus:  
+  id: modbus1
+  uart_id: mod_bus
+    
+  # ++++++++++Conf MODBUS  Controllers ++++++++++++
+
+modbus_controller:
+  - id: cwtby
+    address: 2
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: 300s
+
+  - id: szelm
+    address: 4
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: 1s
+
+  - id: szeli
+    address: 10
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: 1s
+
+  - id: uv
+    address: 20
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: 5s
+    command_throttle: 500ms
+
+  - id: csap
+    address: 30
+    modbus_id: modbus1
+    setup_priority: 610
+    update_interval: 5s
+
+  - id: bat
+    address: 40
+    modbus_id: modbus1
+    setup_priority: -10
+    update_interval: 5s
+
+globals:
+  - id: history
+    type: float[1440]
+    restore_value: no
+
+time:
+  - platform: sntp
+    servers:
+      - 0.hu.pool.ntp.org
+      - 1.hu.pool.ntp.org
+    id: sntp_time
+    on_time:
+      - seconds: 0
+        then:
+          - lambda: |-
+              for (int i = 1; i < 1440; i++) {
+                id(history)[i - 1] = id(history)[i];
+              }
+              id(history)[1439] = id(csapadek).state;
+              id(last_hour).publish_state(id(history)[1439] - id(history)[1379]);
+              id(last_day).publish_state(id(history)[1439] - id(history)[0]);
+              ESP_LOGD("main", "history óra %d , %d", id(history)[1439], id(history)[1379]);
+              ESP_LOGD("main", "history nap %d , %d", id(history)[1439], id(history)[0]);
+        
+sensor:
+
+- platform: modbus_controller
+  modbus_controller_id: cwtby
+  id: paratartalom
+  name: "Páratartalom"
+  address: 0x01F4
+  state_class: measurement
+  device_class: humidity
+  unit_of_measurement: "%" 
+  register_type: holding
+  value_type: S_WORD
+  accuracy_decimals: 1
+  filters: 
+    - multiply: 0.1
+
+- platform: modbus_controller
+  modbus_controller_id: cwtby
+  id: homerseklet
+  name: "Hőmérséklet"
+  address: 0x01F5
+  state_class: measurement
+  device_class: temperature
+  unit_of_measurement: "°C" 
+  register_type: holding
+  value_type: S_WORD
+  accuracy_decimals: 1
+  filters: 
+    - multiply: 0.1
+
+- platform: modbus_controller
+  modbus_controller_id: cwtby
+  id: muszerszinti_nyomas
+  name: "Műszerszinti légnyomás"
+  address: 0x01F9
+  state_class: measurement
+  device_class: pressure
+  unit_of_measurement: "hPa" 
+  register_type: holding
+  value_type: S_WORD
+  accuracy_decimals: 2
+
+- platform: template
+  id: tengerszinti_nyomas
+  name: "Tengerszintre számított légnyomás"
+  state_class: measurement
+  device_class: pressure
+  unit_of_measurement: "hPa"
+  lambda: |-
+      const float gamma = 0.0065;                                 //Függőleges hőmérsékleti gradiens
+      const float hs = 82.0;                                      //Tengerszint feletti magasság
+      const float r = 287.05;                                     //Száraz levegőre vonatkozó gázállandó
+      const float g = 9.80665;                                    //Nehézségi gyorsulás
+
+      float T = id(homerseklet).state;                        //Műszer szinti hőmérséklet °K-ben
+      float P = id(muszerszinti_nyomas).state;                //Műszer szinti nyomás Pa-ban
+      float TT = T + 273.15 + gamma + hs;
+      float E = gamma * hs;
+      float F = g / (gamma * r);
+
+      return P * 100 / (powf(1 - E / TT,F)) / 100;                  //Tengerszintre számított nyomás hPa-ban
+
+- platform: template
+  id: harmatpont
+  name: "Harmatpont"
+  device_class: temperature
+  unit_of_measurement: "°C"
+  accuracy_decimals: 2
+  lambda: |- 
+      const float alpha = 6.1121;                     // (mbar)
+      const float beta = 18.678;
+      const float gamma = 257.14;                    // (°C)
+
+      float RH = id(paratartalom).state;          // Relatív páratartalom
+      float T = id(homerseklet).state;            // Hőmérséklet
+      float H = log( RH/100 ) + beta*T/(gamma+T);
+
+      return (gamma)*H/(beta - H);
+        
+
+- platform: modbus_controller
+  modbus_controller_id: szelm
+  id: szel
+  name: "Szél"
+  address: 0x0000
+  state_class: measurement
+  device_class: wind_speed
+  unit_of_measurement: "m/s" 
+  register_type: holding
+  value_type: S_WORD
+  accuracy_decimals: 1
+  internal: True
+  filters:
+      - multiply: 0.1
+
+- platform: template
+  id: szelsebesseg_m_s
+  name: "Szélsebesség m/s"
+  state_class: measurement
+  device_class: wind_speed
+  unit_of_measurement: "m/s"
+  lambda: |-
+    return id(szel).state;
+  filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+- platform: template
+  id: szelsebesseg_km_h
+  name: "Szélsebesség km/h"
+  state_class: measurement
+  device_class: wind_speed
+  unit_of_measurement: "km/h"
+  lambda: |-
+    return id(szel).state * 3.6;
+  filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+
+- platform: template
+  id: szellokes_m_s
+  name: "Széllökés m/s"
+  state_class: measurement
+  device_class: wind_speed
+  unit_of_measurement: "m/s" 
+  accuracy_decimals: 1
+  lambda: |- 
+    return id(szel).state;
+  filters:
+      - max:
+          window_size: 5
+          send_every: 1
+
+- platform: template
+  id: szellokes_km_h
+  name: "Széllökés km/h"
+  state_class: measurement
+  device_class: wind_speed
+  unit_of_measurement: "km/h" 
+  accuracy_decimals: 1
+  lambda: |- 
+    return id(szel).state * 3.6;
+  filters:
+      - max:
+          window_size: 5
+          send_every: 1
+
+- platform: modbus_controller
+  modbus_controller_id: szeli
+  id: szelirany
+  name: "Szélirány"
+  register_type: holding
+  address: 0
+  value_type: S_WORD
+  accuracy_decimals: 0
+  internal: True
+  on_value:
+    - lambda: |-
+        switch (int(x)) {
+          case 0:
+            id(wind_direction_cardinal).publish_state("N");  //North
+            break;
+          case 1:
+            id(wind_direction_cardinal).publish_state("NNE"); //North-NorthEast
+            break;
+          case 2:
+            id(wind_direction_cardinal).publish_state("NE"); //North-East
+            break;
+          case 3:
+            id(wind_direction_cardinal).publish_state("ENE"); //East-NorthEast
+            break;
+          case 4:
+            id(wind_direction_cardinal).publish_state("E");  //East
+            break;
+          case 5:
+            id(wind_direction_cardinal).publish_state("SEE"); //South-East-East
+            break;
+          case 6:
+            id(wind_direction_cardinal).publish_state("SE"); //South-East
+            break;
+          case 7:
+            id(wind_direction_cardinal).publish_state("SES"); //South-East-South
+            break;
+          case 8:
+            id(wind_direction_cardinal).publish_state("S");  //South
+            break;
+          case 9:
+            id(wind_direction_cardinal).publish_state("SWS"); //South-West-South
+            break;
+          case 10:
+            id(wind_direction_cardinal).publish_state("SW"); //South-West
+            break;
+          case 11:
+            id(wind_direction_cardinal).publish_state("SWW"); //South-West-West
+            break;
+          case 12:
+            id(wind_direction_cardinal).publish_state("W");  //West
+            break;
+          case 13:
+            id(wind_direction_cardinal).publish_state("NWW");  //North-West-West
+            break;
+          case 14:
+            id(wind_direction_cardinal).publish_state("NW"); //North-West
+            break;
+          case 15:
+            id(wind_direction_cardinal).publish_state("NWN"); //North-West-North
+            break;
+          default:
+            id(wind_direction_cardinal).publish_state("");   //invalid
+        }
+
+- platform: modbus_controller
+  modbus_controller_id: csap
+  id: csapadek
+  name: "Csapadék"
+  address: 0x0000
+  register_type: holding
+  value_type: S_WORD
+  accuracy_decimals: 1
+  filters: 
+    - multiply: 0.1
+
+- platform: template
+  id: last_hour
+  name: "Csapadék elmúlt 1 óra"
+  state_class: measurement
+  device_class: precipitation_intensity
+  unit_of_measurement: "mm/h"
+  update_interval: never
+
+- platform: template
+  id: last_day
+  name: "Csapadék elmúlt 1 nap"
+  state_class: measurement
+  device_class: precipitation_intensity
+  unit_of_measurement: "mm/d"
+  update_interval: never
+
+- platform: modbus_controller
+  modbus_controller_id: uv
+  id: uv_intensity
+  name: "UV Intenzitás"
+  address: 0x0000
+  register_type: holding
+  value_type: S_WORD
+  state_class: measurement
+  device_class: irradiance
+  unit_of_measurement: "mW/cm²"
+  accuracy_decimals: 4
+  filters: 
+    - calibrate_linear: 
+        method: least_squares
+        datapoints:
+        - 0.0 -> 0.0
+        - 15.0 -> 0.0375
+    - multiply: 0.01
+  
+- platform: modbus_controller
+  modbus_controller_id: bat
+  id: battery_v
+  name: "Akkumulátor feszültség"
+  address: 0x0000
+  state_class: measurement
+  device_class: voltage
+  unit_of_measurement: "V" 
+  register_type: holding
+  value_type: S_WORD
+  accuracy_decimals: 2
+  filters: 
+    - multiply: 0.01
+        
+
+- platform: template
+  name: "UV intenzitás W/m2"
+  id: uv_intensity_szamolt
+  unit_of_measurement: "W/m²"
+  device_class: irradiance
+  state_class: measurement
+  accuracy_decimals: 3
+  lambda: |-
+    return id(uv_intensity).state / 1000 * 10000;
+
+#- platform: modbus_controller
+#  modbus_controller_id: uv
+#  id: uv_index
+#  name: "UV Index"
+#  address: 0x0001
+#  register_type: holding
+#  value_type: S_WORD
+#  state_class: measurement
+
+- platform: template
+  id: uv_index_calculated
+  name: "UV Index számolt"
+  unit_of_measurement: ""
+  accuracy_decimals: 2
+  lambda: |-
+    return id(uv_intensity_szamolt).state * 40;
+
+- platform: pmsx003
+  type: PMSX003
+  uart_id: pms_bus
+  pm_1_0:
+    id: pm_1_0
+    name: "PM1"
+    internal: True
+  pm_2_5:
+    id: pm_2_5
+    name: "PM2,5"
+    internal: True
+  pm_10_0:
+    id: pm_10_0
+    name: "PM10"
+    internal: True
+
+- platform: template
+  name: "Részecske koncentráció <1.0µm"
+  id: pm1
+  lambda: |-
+    if (id(pms_awake_and_warm).state) {
+      return (id(pm_1_0).state);
+    } else {
+      return (id(pm1).state);
+    }
+  update_interval: 1s
+  filters:
+    - heartbeat: 1s
+  unit_of_measurement: "µg/m³"
+
+- platform: template
+  name: "Részecske koncentráció <2.5µm"
+  id: pm25
+  lambda: |-
+    if (id(pms_awake_and_warm).state) {
+      return (id(pm_2_5).state);
+    } else {
+      return (id(pm25).state);
+    }
+  update_interval: 1s
+  filters:
+    - heartbeat: 1s
+  unit_of_measurement: "µg/m³"
+
+- platform: template
+  name: "Részecske koncentráció <10µm"
+  id: pm10
+  lambda: |-
+    if (id(pms_awake_and_warm).state) {
+      return (id(pm_10_0).state);
+    } else {
+      return (id(pm10).state);
+    }
+  update_interval: 1s
+  filters:
+    - heartbeat: 1s
+  unit_of_measurement: "µg/m³"
+
+- platform: wifi_signal
+  name: "WiFi Signal Sensor"
+  update_interval: 60s
+
+text_sensor:
+  - platform: template
+    name: "Szélirány"
+    id: wind_direction_cardinal
+    icon: mdi:compass-rose
+
+button:
+  - platform: restart
+    name: "Station Restart"
+  
+switch:
+#PMS7003 felébresztése kimenet.
+  - platform: gpio
+    pin: 
+      number: GPIO22
+      inverted: no
+    id: pms_set
+    name: "PMS7003 ébresztés"
+
+interval:
+#PMS-hez intervallum beaállítása a kimenet kapcsolására
+  - interval: 300s
+    then:
+      - switch.turn_on: pms_set
+      - delay: 40s
+      - switch.turn_off: pms_set
+
+binary_sensor:
+  - platform: template
+    name: "PMS is awake and warm"
+    id: pms_awake_and_warm
+    lambda: |-
+      if (id(pms_set).state) {
+        return true;
+      } else {
+        return false;
+      }
+    filters:
+      - delayed_on: 30s
+    internal: True
+
+#number:
+#  - platform: modbus_controller
+#    modbus_controller_id: uv
+#    id: uv_intensity_calibration
+#    name: "UV Intenzitás kalibrálás"
+#    address: 0x0052
+#    register_type: holding
+#    value_type: S_WORD
+#    mode: BOX
