@@ -32,4 +32,4 @@ Funkciók:
 ESP:
   - ESP32-WROOM 38pin
 
-Az állomás akkumulátorról üzemel, amelyhez tartozik egy kapocsfeszültség mérő, típusa: N43VD04 feszültség mérő.
+Az állomás akkumulátorról és napelemről üzemel egy mppt töltésvezérlő segítségével, amelyhez tartozik egy kapocsfeszültség mérő, típusa: N43VD04 feszültség mérő.
